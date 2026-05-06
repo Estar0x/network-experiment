@@ -63,6 +63,7 @@ def raw_terminal():
 class UDPRemoteTerminalClient:
     """UDP 远程终端的客户端侧实现。"""
 
+    # 客户端组件
     def __init__(
         self,
         server: Address,
@@ -141,34 +142,43 @@ class UDPRemoteTerminalClient:
             self.sock.close()
         except OSError:
             pass
-
+    
+    # 键盘输入与读取
     def run_interactive(self) -> int:
         """运行完整交互模式：本地按键会变成远程终端输入。"""
+        # 交互模式必须连接真实终端，因为后面要切 raw 模式并逐字节读取键盘输入。
         if not sys.stdin.isatty() or not sys.stdout.isatty():
             print("interactive mode requires a real terminal", file=sys.stderr)
             return 2
 
         print(f"Connected to {self.server[0]}:{self.server[1]} as client {self.client_id}.")
         print("Press Ctrl-] to close the client.")
+        # 启动后台接收线程和心跳线程，并先把当前窗口大小发给服务端。
         self.start()
 
+        # 保存原来的窗口变化信号处理函数，退出时需要恢复。
         old_winch = signal.getsignal(signal.SIGWINCH)
 
         def on_winch(_signum: int, _frame: object) -> None:
+            # 信号处理函数里只做标记，真正发送窗口大小放到主循环里完成。
             self.resize_event.set()
 
         # 本地窗口大小变化需要转发给服务端，方便全屏程序重新绘制界面。
         signal.signal(signal.SIGWINCH, on_winch)
 
         try:
+            # raw 模式会让 Ctrl+C、退格、Tab 等按键变成普通字节，方便透明转发给远程 PTY。
             with raw_terminal():
                 while not self.stop_event.is_set():
+                    # select 等待键盘输入，同时每 0.2 秒醒来检查退出和窗口变化。
                     readable, _, _ = select.select([sys.stdin], [], [], 0.2)
                     if self.resize_event.is_set():
+                        # 终端大小变化后，把最新行列数同步给服务端。
                         self.resize_event.clear()
                         self.send_window_size()
                     if not readable:
                         continue
+                    # 读取本地键盘字节，可能是普通字符，也可能是控制字符。
                     data = os.read(sys.stdin.fileno(), 512)
                     if not data:
                         break
@@ -176,10 +186,13 @@ class UDPRemoteTerminalClient:
                         # Ctrl-] 是本地退出键；Ctrl+C 不在这里拦截，而是透明发送给远程 PTY。
                         before, _, _ = data.partition(b"\x1d")
                         if before:
+                            # Ctrl-] 前面已经输入的内容仍然正常发给远程端。
                             self.send_input(before)
                         break
+                    # 其他输入全部作为远程终端输入，通过可靠 UDP 发送给服务端。
                     self.send_input(data)
         finally:
+            # 无论正常退出还是异常退出，都恢复信号处理并关闭远程会话。
             signal.signal(signal.SIGWINCH, old_winch)
             self.close()
         return 0
@@ -191,7 +204,8 @@ class UDPRemoteTerminalClient:
         finished = self.stop_event.wait(timeout)
         self.close()
         return 0 if finished and not self.failed_event.is_set() else 1
-
+    
+    # 输入切片与发送
     def send_input(self, data: bytes) -> bool:
         """把终端输入切分成不会超过 UDP 安全载荷的片段。"""
         ok = True
@@ -206,7 +220,8 @@ class UDPRemoteTerminalClient:
         size = shutil.get_terminal_size(fallback=(80, 24))
         payload = struct.pack("!HH", size.lines, size.columns)
         return self._send_control(CMD_WINDOW, payload)
-
+    
+    # 输入发送
     def _send_control(self, subtype: bytes, body: bytes = b"") -> bool:
         """通过可靠发送端排队发送一个命令报文。"""
         payload = subtype + body
@@ -226,7 +241,8 @@ class UDPRemoteTerminalClient:
                 self.failed_event.set()
                 self.stop_event.set()
                 return
-
+    
+    # 收到 ACK / 输出报文
     def _receive_loop(self) -> None:
         """接收 UDP 报文，并分流处理 ACK 或远程输出。"""
         while not self.stop_event.is_set():
@@ -259,7 +275,8 @@ class UDPRemoteTerminalClient:
             # 输出报文先经过 Go-Back-N 接收端，确认按序后再打印。
             ack = self.output_receiver.accept(packet)
             self._send_ack_state(ack)
-
+    
+    # 输出显示
     def _deliver_output(self, packet: Packet) -> None:
         """把已经按序接收的服务端输出打印到本地终端。"""
         payload = packet.payload

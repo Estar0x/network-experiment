@@ -70,6 +70,7 @@ class ClientSession:
     lock: threading.RLock = field(default_factory=threading.RLock)
     closed: bool = False
 
+    # 创建可靠传输组件
     def __post_init__(self) -> None:
         # 两个方向各有一个可靠传输对象：客户端输入按序接收，服务端输出按滑动窗口发送。
         self.output_sender = GoBackNSender(
@@ -105,6 +106,7 @@ class ClientSession:
         except OSError as exc:
             self.server.log(f"client {self.client_id} ACK send failed: {exc}")
 
+    # 创建 PTY shell
     def ensure_shell(self) -> None:
         """首次收到客户端输入时创建对应的 PTY shell。"""
         with self.lock:
@@ -143,6 +145,7 @@ class ClientSession:
         size = struct.pack("HHHH", self.rows, self.cols, 0, 0)
         fcntl.ioctl(self.master_fd, termios.TIOCSWINSZ, size)
 
+    # 把客户端键盘输入写进远程 shell
     def write_input(self, data: bytes) -> None:
         """把已经按序确认的客户端输入写入 PTY。"""
         self.ensure_shell()
@@ -199,6 +202,7 @@ class ClientSession:
         if packet.msg_type == TYPE_COMMAND:
             self._handle_command_packet(packet)
 
+    # 读远程 shell 的输出，并发送回客户端
     def _read_pty_output(self) -> None:
         """持续读取远程 shell 输出，并可靠发送回客户端。"""
         fd = self.master_fd
@@ -240,6 +244,7 @@ class ClientSession:
             self.server.forget_session(self)
             self.server.log(f"client {self.client_id} shell exited")
 
+    # 处理命令报文
     def _handle_command_packet(self, packet: Packet) -> None:
         """分发 TYPE_COMMAND 报文中携带的命令子类型。"""
         payload = packet.payload
@@ -265,6 +270,7 @@ class ClientSession:
 class UDPRemoteTerminalServer:
     """把多个客户端 ID 复用到独立会话上的 UDP 服务端。"""
 
+    # 服务端组件
     def __init__(
         self,
         host: str,
@@ -288,7 +294,7 @@ class UDPRemoteTerminalServer:
         self.offline_timeout = offline_timeout
         self.verbose = verbose
 
-        # 服务端接收循环和各客户端发送线程共用一个 UDP socket；这里使用 sendto 是安全的。
+        # 服务端接收循环和各客户端发送线程共用一个 UDP socket；
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.bind((host, port))
         self.sock.settimeout(0.5)
@@ -301,6 +307,7 @@ class UDPRemoteTerminalServer:
         if self.verbose:
             print(f"[server] {message}", file=sys.stderr, flush=True)
 
+    # 服务段主循环
     def serve_forever(self) -> None:
         """主接收循环：解析数据报，并定期清理超时客户端。"""
         print(f"UDP terminal server listening on {self.host}:{self.port}", flush=True)
@@ -362,6 +369,7 @@ class UDPRemoteTerminalServer:
         ack = session.incoming_receiver.accept(packet)
         session._send_ack_state(ack)
 
+    # 根据 client_id 找会话，没有就创建
     def _get_session(self, client_id: int, addr: Address) -> ClientSession:
         """获取指定客户端 ID 的会话，不存在时创建新会话。"""
         with self.clients_lock:
